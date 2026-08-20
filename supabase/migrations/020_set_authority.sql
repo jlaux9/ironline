@@ -1,0 +1,54 @@
+-- PHASE 2 — BREAKING. Apply only AFTER the updated save-set is deployed.
+--
+-- 003_workouts_and_sets.sql let any authenticated client INSERT and UPDATE
+-- rows in `sets` for their own sessions. The official Swift client always
+-- goes through save-set, but the policy — not the client — is what defines
+-- the boundary. A direct PostgREST call could author reps_completed,
+-- reps_attempted, weight and rom_pass_rate at will, or edit a stored set
+-- afterwards. Every competitive number downstream is derived from that
+-- table: THE LINE, PRs, ghosts, duel line_scores, ELO. A forged row there
+-- forges all of them, and the camera referee is bypassed entirely.
+--
+-- Verified before adopting this: the reconciled iOS client has no direct
+-- set-write call sites. It writes only `users` (profile) and
+-- `workout_sessions` (create/complete). Sets are written exclusively by
+-- save-set, which now verifies session ownership and writes with the
+-- service role.
+--
+-- SELECT is deliberately left alone — the history views, calculate-line and
+-- get-history all read sets under the caller's own JWT, and that read
+-- scoping is still what keeps one user out of another's history.
+--
+-- UPDATE is dropped with no replacement: nothing in the reconciled tree
+-- edits a set after it is written. is_pr is decided at insert time. If a
+-- later feature needs to amend a set, it belongs in an Edge Function that
+-- can re-derive whatever depends on it, not in a client-side patch.
+--
+-- TRUST BOUNDARY — state this precisely, because it is easy to overclaim.
+--
+-- What this migration does:
+--   * closes direct PostgREST mutation of `sets`
+--   * centralises all ordinary set writes through save-set
+--   * save-set verifies authentication and that the session belongs to the
+--     caller before writing
+--
+-- What it does NOT do:
+--   * it does not independently verify that the reported reps, weight or ROM
+--     came from the camera referee. save-set accepts those fields from its
+--     caller and stores them.
+--   * it does not require an attacker to tamper with the app. save-set is an
+--     authenticated public Edge Function; any user who can sign in can call
+--     it directly with a crafted HTTP request and a fabricated payload. No
+--     rooted or modified client is needed.
+--
+-- So this is authority hygiene, not anti-cheat: it removes a second, wholly
+-- unpoliced write path and gives every set write one auditable entry point.
+-- It does not make a reported rep trustworthy.
+--
+-- Making competitive numbers actually attestable would need something like
+-- App Attest / device attestation on the caller, or referee evidence the
+-- server can verify independently (pose summaries, signed frames). Both are
+-- outside V1 scope. Nothing here should be described as "server-verified
+-- reps".
+drop policy if exists "Users can insert sets into their own sessions" on public.sets;
+drop policy if exists "Users can update sets from their own sessions" on public.sets;

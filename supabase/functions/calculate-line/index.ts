@@ -1,8 +1,6 @@
-// Recalculates THE LINE for a user × exercise. Called by the client right
-// after a session is marked completed (framework §12: keep V1 simple — no
-// DB webhook needed for this).
+// Recalculates THE LINE for the authenticated user × exercise.
 //
-// docs/framework.md §6:
+// Core V1 model:
 //   1. last N sets (max 30)
 //   2. e1RM per set via Epley
 //   3. recency weighting, half-life 14 days
@@ -10,8 +8,15 @@
 //   5. convert back to weight x reps using typical rep count
 //   6. confidence = min(sessions / 10, 1.0)
 //
-// Adaptation (beat/miss the LINE 3x in a row) has no framework-specified
-// constants — the +2%/70-30 blend below are simple, tunable V1 defaults.
+// Important authority rule: the user-scoped client is used for authentication
+// and RLS-protected reads. Only the service-role client may write THE LINE, so
+// a client cannot author a the_line row directly.
+//
+// That is a statement about write paths, not about trustworthiness. THE LINE
+// is derived from `sets`, and save-set stores the rep/weight/ROM values its
+// caller reports — so a fabricated set still produces a "legitimately"
+// computed LINE. See 020_set_authority.sql for where that boundary actually
+// sits.
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { corsHeaders } from "../_shared/cors.ts";
 import { estimatedOneRepMax, predictedWeightFor } from "../_shared/line.ts";
@@ -20,18 +25,23 @@ const HALF_LIFE_DAYS = 14;
 const LINE_MULTIPLIER = 0.92;
 const MIN_SESSIONS = 3;
 const BEAT_STREAK_BONUS = 1.02;
-const MISS_STREAK_DAMPING = 0.3; // weight given to the new (lower) value
+const MISS_STREAK_DAMPING = 0.3;
 
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") {
     return new Response("ok", { headers: corsHeaders });
   }
 
+  const supabaseUrl = Deno.env.get("SUPABASE_URL")!;
+  const anonKey = Deno.env.get("SUPABASE_ANON_KEY")!;
+  const serviceRoleKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+
   const supabase = createClient(
-    Deno.env.get("SUPABASE_URL")!,
-    Deno.env.get("SUPABASE_ANON_KEY")!,
+    supabaseUrl,
+    anonKey,
     { global: { headers: { Authorization: req.headers.get("Authorization")! } } },
   );
+  const admin = createClient(supabaseUrl, serviceRoleKey);
 
   const { data: { user }, error: authError } = await supabase.auth.getUser();
   if (authError || !user) {
@@ -64,7 +74,6 @@ Deno.serve(async (req) => {
   }
 
   const sessionsCount = new Set((sets ?? []).map((s) => s.session_id)).size;
-
   if (sessionsCount < MIN_SESSIONS) {
     return new Response(
       JSON.stringify({ baseline: true, sessions_remaining: MIN_SESSIONS - sessionsCount }),
@@ -97,16 +106,32 @@ Deno.serve(async (req) => {
     .limit(1)
     .maybeSingle();
 
-  if (previous && sets!.length >= 3) {
+  if (previous) {
     const prevE1RM = estimatedOneRepMax(previous.predicted_weight, previous.predicted_reps);
-    const last3 = sets!.slice(0, 3).map((s) => estimatedOneRepMax(s.weight, s.reps_completed));
-    const allBeat = last3.every((e) => e > prevE1RM);
-    const allMissed = last3.every((e) => e < prevE1RM);
 
-    if (allBeat) {
-      lineE1RM *= BEAT_STREAK_BONUS;
-    } else if (allMissed) {
-      lineE1RM = prevE1RM * (1 - MISS_STREAK_DAMPING) + lineE1RM * MISS_STREAK_DAMPING;
+    // Three wins/misses means three distinct sessions, not three sets from one workout.
+    const bestBySession = new Map<string, number>();
+    for (const s of sets!) {
+      const e1RM = estimatedOneRepMax(s.weight, s.reps_completed);
+      bestBySession.set(s.session_id, Math.max(bestBySession.get(s.session_id) ?? 0, e1RM));
+    }
+
+    const recentSessionIds: string[] = [];
+    for (const s of sets!) {
+      if (!recentSessionIds.includes(s.session_id)) recentSessionIds.push(s.session_id);
+      if (recentSessionIds.length === 3) break;
+    }
+
+    if (recentSessionIds.length === 3) {
+      const last3Sessions = recentSessionIds.map((id) => bestBySession.get(id)!);
+      const allBeat = last3Sessions.every((e) => e > prevE1RM);
+      const allMissed = last3Sessions.every((e) => e < prevE1RM);
+
+      if (allBeat) {
+        lineE1RM *= BEAT_STREAK_BONUS;
+      } else if (allMissed) {
+        lineE1RM = prevE1RM * (1 - MISS_STREAK_DAMPING) + lineE1RM * MISS_STREAK_DAMPING;
+      }
     }
   }
 
@@ -114,7 +139,7 @@ Deno.serve(async (req) => {
   const confidence = Math.min(sessionsCount / 10, 1.0);
   const version = (previous?.version ?? 0) + 1;
 
-  const { data: line, error: insertError } = await supabase
+  const { data: line, error: insertError } = await admin
     .from("the_line")
     .insert({
       user_id: user.id,

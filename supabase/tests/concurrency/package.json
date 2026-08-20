@@ -1,0 +1,13 @@
+{
+  "name": "ironline-db-concurrency-tests",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Real concurrent-transaction tests against the local CI Postgres. Never points at production.",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.11.5"
+  }
+}

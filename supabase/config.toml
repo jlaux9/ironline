@@ -1,0 +1,50 @@
+# Local development / CI only. This file never points at the production
+# project: `supabase start` runs an isolated Postgres in Docker, and CI never
+# runs `supabase link`, so no production credentials or project ref are
+# involved anywhere in this repo.
+project_id = "ironline-local"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+shadow_port = 54320
+major_version = 15
+
+[db.pooler]
+enabled = false
+
+[studio]
+enabled = false
+
+[inbucket]
+enabled = false
+
+[storage]
+enabled = false
+
+[realtime]
+enabled = false
+
+[auth]
+enabled = true
+site_url = "http://127.0.0.1:3000"
+jwt_expiry = 3600
+enable_signup = true
+
+[auth.email]
+enable_signup = true
+enable_confirmations = false
+
+# Deliberately no [db.seed] entry. The CLI's default seed path is
+# supabase/seed.sql; our fixtures live in supabase/seed/*.sql and are NOT
+# auto-applied, which matters because qa_test_data.sql assumes auth.users rows
+# that only exist in the real project. Tests create their own auth users.
+
+[edge_runtime]
+enabled = false

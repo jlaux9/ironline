@@ -26,17 +26,42 @@ Deno.serve(async (req) => {
     return new Response(JSON.stringify({ error: "duel_id and action (accept/decline) are required" }), { status: 400, headers: jsonHeaders });
   }
 
-  const { data: duel, error } = await supabase
+  // 019 removes client UPDATE authority on duels, so this write goes through
+  // the service role. The authorization it replaces is reproduced explicitly:
+  // only this duel, only its opponent, only out of 'pending'. Those filters
+  // are the whole permission check now — never relax them.
+  //
+  // The status filter also makes this a compare-and-swap: a double-tapped
+  // accept transitions once and the second call matches no row.
+  const admin = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
+  );
+
+  // expires_at is part of the filter, not a prior check. The cron sweep only
+  // flips expired duels every 15 minutes, so a duel past its deadline still
+  // reads 'pending' for up to that long — and checking expiry beforehand
+  // would race with cron flipping the row. As part of the condition, an
+  // expired duel simply matches nothing.
+  const { data: duel, error } = await admin
     .from("duels")
     .update({ status: action === "accept" ? "accepted" : "declined" })
     .eq("id", duel_id)
     .eq("opponent_id", user.id)
     .eq("status", "pending")
+    .gt("expires_at", new Date().toISOString())
     .select()
-    .single();
+    .maybeSingle();
 
   if (error) {
     return new Response(JSON.stringify({ error: error.message }), { status: 400, headers: jsonHeaders });
+  }
+
+  if (!duel) {
+    return new Response(
+      JSON.stringify({ error: "duel not found, not yours to answer, already answered, or expired" }),
+      { status: 409, headers: jsonHeaders },
+    );
   }
 
   return new Response(JSON.stringify({ duel }), { headers: jsonHeaders });

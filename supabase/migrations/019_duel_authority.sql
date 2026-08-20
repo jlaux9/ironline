@@ -1,0 +1,32 @@
+-- PHASE 2 — BREAKING. Apply only AFTER create-duel, respond-duel, and
+-- resolve-duel have been deployed. Those functions stop relying on client
+-- policies and write with the service role; applying this first would break
+-- the currently live ones.
+--
+-- Removes both client write paths on duels. 008_duels.sql is applied
+-- production history and stays untouched.
+--
+-- UPDATE — the audit's finding 1. 008 granted the opponent
+--   for update using (auth.uid() = opponent_id)
+-- With no WITH CHECK, Postgres reuses USING as the check, so opponent_id was
+-- safe but every other column was writable: an opponent could PATCH
+-- /duels?id=eq.<id> setting winner_id to themselves and status to
+-- 'completed', never touching resolve-duel.
+--
+-- INSERT — the second-pass finding. 008 also granted
+--   for insert with check (auth.uid() = challenger_id)
+-- which only pins challenger_id. A client could POST /duels directly and
+-- author opponent_id, challenger_set_id, and challenger_line_score itself —
+-- so create-duel's friendship, set-ownership, set-age and server-computed
+-- LINE score were advisory, not authoritative. Anyone willing to skip the
+-- function could challenge a non-friend with a forged score.
+--
+-- Both are dropped rather than narrowed. A WITH CHECK column blacklist would
+-- leave every future column writable by default, and would have to be
+-- revisited on every schema change — the failure mode is silent.
+--
+-- After this, duels is client-read-only: SELECT (participants, from 008)
+-- stays, all writes go through authenticated Edge Functions that validate
+-- first and then write with the service role.
+drop policy if exists "Opponent can respond to and resolve a duel" on public.duels;
+drop policy if exists "Challenger can create a duel" on public.duels;

@@ -1,0 +1,187 @@
+name: Database CI
+
+# Backend/database integration gate. Runs against a throwaway local Supabase
+# stack in Docker on the runner -- never the production project. There is no
+# `supabase link` step, no project ref, and no secrets: if this workflow ever
+# needs a credential, something has gone wrong.
+#
+# This is an additional gate, not a replacement. iOS build/tests and the static
+# authority invariants still run in ios-ci.yml.
+
+on:
+  push:
+    branches: [main, first-playable]
+  pull_request:
+
+jobs:
+  database:
+    name: migrations + pgTAP + concurrency
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Show CLI version
+        run: supabase --version
+
+      # `supabase start` applies supabase/migrations in filename order against a
+      # fresh database. Reaching the end of this step is itself the bootstrap
+      # assertion: the full 001->021 chain applied cleanly from scratch,
+      # including the pg_cron work in 008 and 021.
+      - name: Start local Supabase (applies migrations 001-022 from scratch)
+        run: supabase start
+
+      # Explicit from-scratch re-apply of the whole chain, so the bootstrap
+      # assertion does not depend on whatever `supabase start` cached.
+      - name: Re-apply migrations from scratch
+        run: supabase db reset
+
+      - name: Report applied migration chain
+        run: |
+          supabase migration list --local || true
+          echo "--- migration files in repo ---"
+          ls supabase/migrations
+
+      # If pgTAP resolution fails again, this puts the reason in the step output
+      # instead of leaving it to guesswork -- the raw job log needs admin scope
+      # to download, so the diagnosis has to be visible here.
+      - name: Probe pgTAP availability
+        env:
+          PGURL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+        run: |
+          psql "$PGURL" -c "select name, default_version, installed_version from pg_available_extensions where name = 'pgtap';"
+          psql "$PGURL" -c "select extname, nspname from pg_extension e join pg_namespace n on n.oid = e.extnamespace;"
+          echo "--- test files discovered ---"
+          ls -la supabase/tests
+
+      # STAGE A -- report the privilege model the fresh migration chain actually
+      # produces, before changing anything. The pgTAP failure was
+      # "permission denied for table workout_sessions" on a plain SELECT, which
+      # is a table-level GRANT problem, not an RLS one: policies never get
+      # consulted if the role has no privilege on the table at all.
+      #
+      # Compact single-line-per-table output so it survives the annotation cap.
+      # S=SELECT I=INSERT U=UPDATE D=DELETE, "-" means no grant.
+      - name: "Privilege matrix (diagnostic)"
+        env:
+          PGURL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+        run: |
+          set -e
+          TBL=$(psql "$PGURL" -At -c "
+            select table_name
+                   || ' auth=' || coalesce(a,'-')
+                   || ' svc='  || coalesce(s,'-')
+                   || ' anon=' || coalesce(an,'-')
+              from (
+                select table_name,
+                  string_agg(distinct left(privilege_type,1), '' order by left(privilege_type,1))
+                    filter (where grantee = 'authenticated') as a,
+                  string_agg(distinct left(privilege_type,1), '' order by left(privilege_type,1))
+                    filter (where grantee = 'service_role')  as s,
+                  string_agg(distinct left(privilege_type,1), '' order by left(privilege_type,1))
+                    filter (where grantee = 'anon')          as an
+                from information_schema.role_table_grants
+                where table_schema = 'public'
+                  and privilege_type in ('SELECT','INSERT','UPDATE','DELETE')
+                group by table_name
+              ) x order by table_name;")
+
+          FN=$(psql "$PGURL" -At -c "
+            select routine_name || ' -> ' || string_agg(distinct grantee, ',' order by grantee)
+              from information_schema.role_routine_grants
+             where specific_schema = 'public'
+               and grantee in ('anon','authenticated','service_role')
+             group by routine_name order by routine_name;")
+
+          DEF=$(psql "$PGURL" -At -c "
+            select coalesce(string_agg(defaclrole::regrole::text || ':' || defaclacl::text, ' | '), 'NONE')
+              from pg_default_acl d join pg_namespace n on n.oid = d.defaclnamespace
+             where n.nspname = 'public' and d.defaclobjtype = 'r';")
+
+          echo "=== TABLE GRANTS ==="; echo "$TBL"
+          echo "=== FUNCTION GRANTS ==="; echo "$FN"
+          echo "=== DEFAULT ACLS (public, tables) ==="; echo "$DEF"
+
+          {
+            echo "## Data API privilege matrix"
+            echo '```'; echo "$TBL"; echo '```'
+            echo '### function grants'; echo '```'; echo "$FN"; echo '```'
+            echo '### default ACLs'; echo '```'; echo "$DEF"; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          # Emitted as notices, not errors. This was temporarily ::error:: to get the
+          # matrix out through the checks API while diagnosing the missing-grant
+          # defect; keeping it that way would mark every green run with failure
+          # annotations.
+          echo "$TBL" | while IFS= read -r l; do echo "::notice title=grants::${l}"; done
+          echo "::notice title=grants::DEFAULT_ACL ${DEF}"
+
+      # Schema, policies, grants and constraints. Asserts the real denials, not
+      # the presence of a DROP POLICY line.
+      # `supabase test db` failure detail only exists in the raw job log, which
+      # needs admin scope to download. Echo the output back as ::error::
+      # annotations so the actual pgTAP diagnostic is readable from the checks
+      # API instead of just "exit code 1".
+      - name: pgTAP database tests
+        run: |
+          set +e
+          OUT=$(supabase test db 2>&1)
+          CODE=$?
+          echo "$OUT"
+          if [ "$CODE" -ne 0 ]; then
+            # Annotations are capped per step, and a cold pg_prove image pull
+            # floods stdout with layer lines. Keep only pgTAP-relevant output so
+            # the cap is spent on the actual diagnostic rather than Docker noise.
+            echo "$OUT" \
+              | grep -viE 'pull complete|download complete|waiting|extracting|verifying|digest:|pulling from|image for|already exists' \
+              | grep -iE 'not ok|failed|looks like|error|fatal|\.test\.sql|result:|aborted' \
+              | head -n 25 \
+              | while IFS= read -r line; do
+                  echo "::error title=pgtap::${line}"
+                done
+          fi
+          exit "$CODE"
+
+      - name: Install concurrency test deps
+        working-directory: supabase/tests/concurrency
+        run: npm install --no-audit --no-fund
+
+      # Real overlapping transactions: exactly-once resolution, ELO applied
+      # once, expiry refusal, global set claims, invite max_uses, and a shared
+      # player across two simultaneous resolutions.
+      # Same annotation trick as the pgTAP step: the harness prints plain console
+      # output, which lives only in the raw job log. Re-emit the result lines so
+      # a failing concurrency scenario is readable from the checks API.
+      - name: Concurrency tests (real simultaneous transactions)
+        working-directory: supabase/tests/concurrency
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:54322/postgres
+        run: |
+          set +e
+          OUT=$(node run.mjs 2>&1)
+          CODE=$?
+          echo "$OUT"
+          if [ "$CODE" -ne 0 ]; then
+            echo "$OUT" | grep -iE 'FAIL|passed,|  x |error|\[' | head -n 25 \
+              | while IFS= read -r line; do
+                  echo "::error title=concurrency::${line}"
+                done
+          fi
+          exit "$CODE"
+
+      - name: Dump database logs on failure
+        if: failure()
+        run: supabase status || true
+
+      # `if: always()` so a failed assertion still tears the stack down and the
+      # runner does not leak containers.
+      - name: Stop local Supabase
+        if: always()
+        run: supabase stop --no-backup || true

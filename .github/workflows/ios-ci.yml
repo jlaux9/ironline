@@ -1,0 +1,61 @@
+name: iOS CI
+
+on:
+  push:
+    branches: [main, first-playable]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create CI Secrets.plist
+        run: cp IronLine/Resources/Secrets.plist.example IronLine/Resources/Secrets.plist
+
+      - name: Backend authority invariants
+        run: node supabase/checks/authority-invariants.mjs
+
+      - name: Show Xcode environment
+        run: |
+          xcodebuild -version
+          xcrun simctl list devices available
+
+      - name: Select available iPhone simulator
+        shell: bash
+        run: |
+          DEVICE_ID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          for runtime, devices in data.get("devices", {}).items():
+              if "iOS" not in runtime:
+                  continue
+              for device in devices:
+                  if device.get("isAvailable") and device.get("name", "").startswith("iPhone"):
+                      print(device["udid"])
+                      raise SystemExit
+          raise SystemExit("No available iPhone simulator")
+          ')
+          echo "DEVICE_ID=$DEVICE_ID" >> "$GITHUB_ENV"
+          echo "Using simulator $DEVICE_ID"
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate project
+        run: xcodegen generate
+
+      - name: Resolve packages
+        run: xcodebuild -resolvePackageDependencies -project IronLine.xcodeproj -scheme IronLine
+
+      - name: Run unit tests
+        run: |
+          xcodebuild test \
+            -project IronLine.xcodeproj \
+            -scheme IronLine \
+            -destination "platform=iOS Simulator,id=$DEVICE_ID" \
+            CODE_SIGNING_ALLOWED=NO

@@ -8,6 +8,19 @@ enum APIService {
         _ function: String,
         body: some Encodable
     ) async throws -> Response {
-        try await SupabaseConfig.client.functions.invoke(function, options: .init(body: body))
+        try await SupabaseConfig.client.functions.invoke(
+            function,
+            options: .init(body: body)
+        )
+    }
+
+    static func invokeGET<Response: Decodable>(
+        _ function: String,
+        query: [URLQueryItem]
+    ) async throws -> Response {
+        try await SupabaseConfig.client.functions.invoke(
+            function,
+            options: .init(method: .get, query: query)
+        )
     }
 }

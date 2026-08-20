@@ -10,6 +10,7 @@ struct IronLineApp: App {
             RootView()
                 .environmentObject(authManager)
                 .environmentObject(appState)
+                .preferredColorScheme(.dark)
         }
     }
 }
@@ -20,10 +21,16 @@ private struct RootView: View {
 
     var body: some View {
         Group {
-            if authManager.isLoading {
-                ProgressView()
+            if appState.isLocalPrototypeMode {
+                HomeView()
+            } else if authManager.isLoading {
+                ZStack {
+                    Theme.Color.background.ignoresSafeArea()
+                    ProgressView()
+                        .tint(Theme.Color.accent)
+                }
             } else if authManager.session == nil {
-                LoginView()
+                LoginView(onTryLocal: appState.enterLocalPrototype)
             } else if appState.currentUser == nil {
                 ProfileSetupView()
                     .task { await loadProfile() }

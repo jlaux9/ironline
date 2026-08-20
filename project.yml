@@ -1,0 +1,44 @@
+name: IronLine
+options:
+  minimumXcodeGenVersion: 2.40.0
+  deploymentTarget:
+    iOS: "17.0"
+  groupSortPosition: top
+
+packages:
+  Supabase:
+    url: https://github.com/supabase/supabase-swift.git
+    from: 2.0.0
+
+targets:
+  IronLine:
+    type: application
+    platform: iOS
+    sources:
+      - path: IronLine
+        excludes:
+          - Resources/Secrets.plist.example
+    dependencies:
+      - package: Supabase
+        product: Supabase
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.ironline.app
+        PRODUCT_NAME: IronLine
+        SWIFT_VERSION: 5.0
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSCameraUsageDescription: IronLine uses the camera to verify exercise reps and range of motion on-device.
+        INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPhone: UIInterfaceOrientationPortrait
+        TARGETED_DEVICE_FAMILY: "1"
+    scheme:
+      testTargets:
+        - IronLineTests
+
+  IronLineTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: IronLineTests
+    dependencies:
+      - target: IronLine

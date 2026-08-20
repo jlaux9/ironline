@@ -44,11 +44,42 @@ Deno.serve(async (req) => {
   if (invite.expires_at && new Date(invite.expires_at) < new Date()) {
     return new Response(JSON.stringify({ error: "code expired" }), { status: 400, headers: jsonHeaders });
   }
+  if (invite.created_by === user.id) {
+    return new Response(JSON.stringify({ error: "you can't redeem your own code" }), { status: 400, headers: jsonHeaders });
+  }
+
   if (invite.max_uses !== null && invite.use_count >= invite.max_uses) {
     return new Response(JSON.stringify({ error: "code has reached its use limit" }), { status: 400, headers: jsonHeaders });
   }
-  if (invite.created_by === user.id) {
-    return new Response(JSON.stringify({ error: "you can't redeem your own code" }), { status: 400, headers: jsonHeaders });
+
+  // Claim a use before doing any work, with the value we read as the guard.
+  // This used to read use_count, compare it to max_uses, and then write
+  // `use_count + 1` as a literal at the end — so two concurrent redemptions
+  // both read 0, both passed the check, and both wrote 1. A single-use code
+  // could be redeemed repeatedly.
+  //
+  // Matching on the value we read makes the increment a compare-and-swap:
+  // whoever commits first moves use_count, and the loser's filter no longer
+  // matches, so it cannot overwrite. The check above still runs first purely
+  // to give the ordinary "limit reached" case a clearer error than a lost
+  // race would. Migration 018 adds a CHECK constraint as the backstop for any
+  // future writer that forgets to do this.
+  const { data: claimed, error: claimError } = await admin
+    .from("invite_codes")
+    .update({ use_count: invite.use_count + 1 })
+    .eq("id", invite.id)
+    .eq("use_count", invite.use_count)
+    .select("id")
+    .maybeSingle();
+
+  if (claimError) {
+    return new Response(JSON.stringify({ error: claimError.message }), { status: 400, headers: jsonHeaders });
+  }
+  if (!claimed) {
+    return new Response(
+      JSON.stringify({ error: "code was redeemed concurrently, try again" }),
+      { status: 409, headers: jsonHeaders },
+    );
   }
 
   if (invite.kind === "friend") {
@@ -100,7 +131,7 @@ Deno.serve(async (req) => {
     }
   }
 
-  await admin.from("invite_codes").update({ use_count: invite.use_count + 1 }).eq("id", invite.id);
-
+  // The use was already claimed above, before any membership work — nothing
+  // to increment here.
   return new Response(JSON.stringify({ ok: true, kind: invite.kind, crew_id: invite.crew_id }), { headers: jsonHeaders });
 });
